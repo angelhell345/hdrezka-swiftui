@@ -1,312 +1,77 @@
-name: Release
+name: Build macOS 14 Intel
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'HDrezka.xcodeproj/project.pbxproj'
   workflow_dispatch:
-
-concurrency:
-  group: release
-  cancel-in-progress: false
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'bump'
-
-    runs-on: xcode-27
-
-    permissions:
-      contents: read
-
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      sha256: ${{ steps.sha256.outputs.sha256 }}
+    runs-on: macos-14
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: '20'
 
-      - name: Inject Firebase config
+      - name: Create dummy Firebase config
         run: |
-          echo "${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}" | base64 --decode > HDrezka/Resources/GoogleService-Info.plist
-          plutil -lint HDrezka/Resources/GoogleService-Info.plist
+          mkdir -p HDrezka/Resources
+          if [ ! -f HDrezka/Resources/GoogleService-Info.plist ]; then
+            cat << 'EOF' > HDrezka/Resources/GoogleService-Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key>
+            <string>AIzaSyDummyKeyForBuild1234567890</string>
+            <key>GCM_SENDER_ID</key>
+            <string>123456789012</string>
+            <key>PLIST_VERSION</key>
+            <string>1</string>
+            <key>BUNDLE_ID</key>
+            <string>io.silentsea.hdrezka</string>
+            <key>PROJECT_ID</key>
+            <string>hdrezka-dummy</string>
+            <key>GOOGLE_APP_ID</key>
+            <string>1:123456789012:ios:1234567890abcdef</string>
+          </dict>
+          </plist>
+          EOF
+          fi
 
       - name: Trust macro plugins
         run: |
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
-      - name: Remove unavailable simulators
-        run: |
-          xcrun simctl delete unavailable
-
-      - name: Install Metal toolchain
-        run: |
-          xcodebuild -downloadComponent MetalToolchain
-
-      - name: Build app
+      - name: Build app for Intel (x86_64)
         run: |
           xcodebuild archive \
             -scheme HDrezka \
             -project HDrezka.xcodeproj \
             -destination 'generic/platform=macOS' \
             -archivePath build/HDrezka.xcarchive \
+            ARCHS="x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
             SKIP_INSTALL=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            -quiet
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Prepare app
+      - name: Prepare and sign app
         run: |
           mkdir -p release
           cp -R build/HDrezka.xcarchive/Products/Applications/HDrezka.app release/
-
-      - name: Sign app
-        run: |
-          codesign \
-            --force \
-            --deep \
-            --sign - \
-            release/HDrezka.app
-
-      - name: Read version
-        id: version
-        run: |
-          VERSION=$(/usr/libexec/PlistBuddy \
-            -c "Print :CFBundleShortVersionString" \
-            "release/HDrezka.app/Contents/Info.plist")
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          codesign --force --deep --sign - release/HDrezka.app
 
       - name: Create DMG
         run: |
-          npx create-dmg \
-            release/HDrezka.app \
-            release/ \
-            --no-code-sign \
-            --no-version-in-filename \
-            --overwrite
-
-      - name: Calculate SHA256
-        id: sha256
-        run: |
-          echo "sha256=$(shasum -a 256 release/HDrezka.dmg | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          npx create-dmg release/HDrezka.app release/ --no-code-sign --no-version-in-filename --overwrite
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: HDrezka-dmg
+          name: HDrezka-macOS14-Intel
           path: release/HDrezka.dmg
-          retention-days: 1
-
-  publish:
-    needs: build
-
-    runs-on: xcode-27
-
-    permissions:
-      contents: write
-
-    env:
-      VERSION: ${{ needs.build.outputs.version }}
-      SHA256: ${{ needs.build.outputs.sha256 }}
-      RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ needs.build.outputs.version }}/HDrezka.dmg
-
-    steps:
-      - name: Download DMG
-        uses: actions/download-artifact@v8
-        with:
-          name: HDrezka-dmg
-          path: release/
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$VERSION" \
-            "release/HDrezka.dmg" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "HDrezka ${VERSION}" \
-            --generate-notes
-
-      - name: Remove previous GitHub Releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release list \
-            --repo "${GITHUB_REPOSITORY}" \
-            --limit 100 \
-            --json tagName,isDraft,isPrerelease \
-            --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
-          while read -r tag; do
-            if [ "$tag" != "${VERSION}" ]; then
-              echo "Removing release: $tag"
-              gh release delete "$tag" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --yes
-            fi
-          done
-
-      - name: Clone releases repository
-        env:
-          TOKEN: ${{ secrets.RELEASES_TOKEN }}
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${TOKEN}@github.com/${{ github.repository_owner }}/hdrezka-releases.git"
-
-      - name: Download Sparkle
-        uses: robinraju/release-downloader@v1
-        with:
-          repository: "sparkle-project/Sparkle"
-          latest: true
-          fileName: "Sparkle*.tar.xz"
-
-      - name: Extract Sparkle
-        run: |
-          mkdir -p Sparkle
-          tar -xf Sparkle*.tar.xz \
-            -C Sparkle \
-            --strip-components=1
-
-      - name: Generate Sparkle appcast
-        env:
-          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: |
-          KEY_FILE=$(mktemp)
-          trap 'rm -f "$KEY_FILE"' EXIT
-
-          echo "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
-
-          mkdir -p sparkle-release
-
-          cp release/HDrezka.dmg sparkle-release/
-
-          rm -f hdrezka-releases/appcast.xml
-
-          ./Sparkle/bin/generate_appcast \
-            --ed-key-file "$KEY_FILE" \
-            --download-url-prefix "$RELEASE_URL" \
-            sparkle-release/
-
-          cp sparkle-release/appcast.xml hdrezka-releases/appcast.xml
-
-      - name: Push Sparkle appcast
-        working-directory: hdrezka-releases
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add appcast.xml
-
-          if ! git diff --cached --quiet; then
-            git commit -m "${VERSION}"
-            git push
-          else
-            echo "No changes detected. Skipping deployment."
-          fi
-
-      - name: Clone Homebrew repository
-        env:
-          TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-        run: |
-          git clone --depth 1 \
-            "https://x-access-token:${TOKEN}@github.com/${{ github.repository_owner }}/homebrew-hdrezka.git"
-
-      - name: Generate Homebrew Cask
-        run: |
-          mkdir -p homebrew-hdrezka/Casks
-
-          cat > homebrew-hdrezka/Casks/hdrezka.rb << EOF
-          cask "hdrezka" do
-            version "${VERSION}"
-            sha256 "${SHA256}"
-
-            url "https://github.com/${{ github.repository }}/releases/download/#{version}/HDrezka.dmg"
-
-            name "HDrezka"
-            desc "Unofficial macOS client for HDrezka"
-            homepage "https://github.com/${{ github.repository }}"
-
-            livecheck do
-              url "https://${{ github.repository_owner }}.github.io/hdrezka-releases/appcast.xml"
-              strategy :sparkle do |items|
-                items.map(&:short_version)
-              end
-            end
-
-            auto_updates true
-            depends_on macos: :sequoia
-
-            app "HDrezka.app"
-
-            postflight_steps do
-              run "/usr/bin/xattr",
-                args: [
-                  "-dr",
-                  "com.apple.quarantine",
-                  "{{appdir}}/HDrezka.app",
-                ]
-            end
-
-            zap trash: [
-              "~/Library/Application Support/HDrezka",
-              "~/Library/Caches/io.silentsea.hdrezka",
-              "~/Library/Preferences/io.silentsea.hdrezka.plist",
-              "~/Library/Saved Application State/io.silentsea.hdrezka.savedState",
-            ]
-
-            caveats <<~EOS
-              Unofficial macOS client for HDrezka.
-
-              This cask automatically removes the quarantine flag during install.
-
-              If Gatekeeper blocks launch, run:
-
-                xattr -dr com.apple.quarantine "/Applications/HDrezka.app"
-            EOS
-          end
-          EOF
-
-      - name: Push Homebrew
-        working-directory: homebrew-hdrezka
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .
-
-          if ! git diff --cached --quiet; then
-            git commit -m "${VERSION}"
-            git push
-          else
-            echo "No changes detected. Skipping deployment."
-          fi
-
-      - name: Send Telegram Message
-        run: |
-          HTML_PAYLOAD=$(cat << EOF
-          <h3>HDrezka v${VERSION}</h3><details open><summary>🇷🇺 Русский</summary><h5>Установка через <a href=https://brew.sh/ru/ >Homebrew</a></h5><p><b>Homebrew 5.x и более ранние версии</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><b>Homebrew 6.x и более новые версии</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew trust voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><i>В Homebrew 6.x необходимо явно доверять сторонним tap-репозиториям перед установкой пакетов из них.</i><p><b>Или скачайте <a href=https://github.com/${{ github.repository }}/releases/latest>последний релиз</a></b><footer><a href=https://github.com/voidboost/hdrezka-swiftui#installation-troubleshooting>Проблемы с установкой?</a></footer></details><details><summary>🇺🇸 English</summary><h5>Install with <a href=https://brew.sh/ >Homebrew</a></h5><p><b>Homebrew 5.x and earlier</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><b>Homebrew 6.x and later</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew trust voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><i>Homebrew 6.x requires explicitly trusting third-party taps before installing packages from them.</i><p><b>Or download <a href=https://github.com/${{ github.repository }}/releases/latest>latest release</a></b><footer><a href=https://github.com/voidboost/hdrezka-swiftui/blob/main/README_EN.md#installation-troubleshooting>Problems with installation?</a></footer></details><details><summary>🇺🇦 Українська</summary><h5>Встановлення через <a href=https://brew.sh/ru/ >Homebrew</a></h5><p><b>Homebrew 5.x та старіші версії</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><b>Homebrew 6.x та новіші версії</b><pre><code class=language-shell>brew tap voidboost/hdrezka && brew trust voidboost/hdrezka && brew install --cask hdrezka</code></pre><p><i>У Homebrew 6.x необхідно явно довіряти стороннім tap-репозиторіям перед встановленням пакетів із них.</i><p><b>Чи завантажте <a href=https://github.com/${{ github.repository }}/releases/latest>останній реліз</a></b><footer><a href=https://github.com/voidboost/hdrezka-swiftui/blob/main/README_UA.md#installation-troubleshooting>Проблеми зі встановленням?</a></footer></details>
-          EOF
-          )
-
-          JSON_PAYLOAD=$(jq -n \
-            --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-            --arg html "$HTML_PAYLOAD" \
-            '{
-              chat_id: $chat_id,
-              rich_message: {
-                html: $html
-              }
-            }')
-
-          curl -X POST \
-            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendRichMessage" \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD"
+          retention-days: 5
